@@ -1,0 +1,141 @@
+name: pocketarchive
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ../postgres/init-app-role.sh:/docker-entrypoint-initdb.d/00-init-app-role.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - archive
+
+  meilisearch:
+    image: getmeili/meilisearch:v1.15
+    restart: unless-stopped
+    environment:
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:?set MEILI_MASTER_KEY in .env}
+      MEILI_ENV: production
+      MEILI_NO_ANALYTICS: "true"
+    volumes:
+      - meili_data:/meili_data
+    networks:
+      - archive
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    restart: unless-stopped
+    command: ["valkey-server", "--appendonly", "yes", "--save", "60", "1"]
+    volumes:
+      - valkey_data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    networks:
+      - archive
+
+  engine:
+    image: ${ENGINE_IMAGE:-ghcr.io/bangsmackpow/pocketarchive-engine:latest}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      meilisearch:
+        condition: service_started
+    environment:
+      ARCHIVE_ENV: production
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      DATABASE_URL: postgres://archive_app:${POSTGRES_PASSWORD}@postgres:5432/archive?sslmode=disable
+      BLOB_STORAGE_PATH: /data/blobs
+      SPOOL_PATH: /data/spool
+      ARCHIVE_MASTER_KEK: ${ARCHIVE_MASTER_KEK:?set ARCHIVE_MASTER_KEK in .env}
+      MEILI_URL: http://meilisearch:7700
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
+      MEILI_INDEX: ${MEILI_INDEX:-messages}
+      VALKEY_URL: redis://valkey:6379
+      SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET in .env}
+      SESSION_TTL: ${SESSION_TTL:-12h}
+      DEFAULT_TENANT_SLUG: ${DEFAULT_TENANT_SLUG:-default}
+      DEFAULT_TENANT_NAME: ${DEFAULT_TENANT_NAME:-Default Archive}
+      DEFAULT_RETENTION_DAYS: ${DEFAULT_RETENTION_DAYS:-2557}
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
+      SMTP_ADDR: :2525
+      SMTP_HOSTNAME: ${SMTP_HOSTNAME:-mail.archive.local}
+      SMTP_ALLOWED_DOMAINS: ${SMTP_ALLOWED_DOMAINS:-}
+      SMTP_ALLOWED_IPS: ${SMTP_ALLOWED_IPS:-}
+      SMTP_AUTH_USERNAME: ${SMTP_AUTH_USERNAME:-}
+      SMTP_AUTH_PASSWORD: ${SMTP_AUTH_PASSWORD:-}
+      SMTP_MAX_MESSAGE_BYTES: ${SMTP_MAX_MESSAGE_BYTES:-104857600}
+      SMTP_TLS_CERT_FILE: ${SMTP_TLS_CERT_FILE:-}
+      SMTP_TLS_KEY_FILE: ${SMTP_TLS_KEY_FILE:-}
+      MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-5368709120}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
+    volumes:
+      - archive_blobs:/data/blobs
+      - archive_spool:/data/spool
+      # Mount a trusted certificate for Microsoft 365 journaling, then set
+      # SMTP_TLS_CERT_FILE=/certs/fullchain.pem and SMTP_TLS_KEY_FILE=/certs/privkey.pem
+      # - /etc/letsencrypt/live/mail.example.com/fullchain.pem:/certs/fullchain.pem:ro
+      # - /etc/letsencrypt/live/mail.example.com/privkey.pem:/certs/privkey.pem:ro
+    ports:
+      - "2525:2525"
+      # Cloud mail connectors normally use port 25. Uncomment only if the host
+      # does not already run a mail server:
+      # - "25:2525"
+      # - "587:2525"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+    networks:
+      - archive
+
+  web:
+    image: ${WEB_IMAGE:-ghcr.io/bangsmackpow/pocketarchive-web:latest}
+    restart: unless-stopped
+    depends_on:
+      engine:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      HOST: 0.0.0.0
+      ENGINE_INTERNAL_URL: http://engine:8080
+      SESSION_COOKIE_SECURE: "true"
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api/health >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 5
+    networks:
+      - archive
+
+networks:
+  archive:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  meili_data:
+  valkey_data:
+  archive_blobs:
+  archive_spool:

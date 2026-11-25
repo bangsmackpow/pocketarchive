@@ -1,0 +1,32 @@
+# Environment / build artefacts
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Go
+engine/engine
+engine/dist/
+*.test
+*.out
+
+# Node / TanStack Start
+web/node_modules/
+web/.output/
+web/.nitro/
+web/.vinxi/
+web/dist/
+web/.tanstack/
+npm-debug.log*
+yarn-error.log*
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local runtime data
+data/
+.data/
+/tmp/

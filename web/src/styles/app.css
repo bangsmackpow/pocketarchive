@@ -1,0 +1,43 @@
+@import 'tailwindcss' source('../');
+
+@theme {
+  --font-sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+@layer base {
+  html {
+    color-scheme: light;
+  }
+
+  body {
+    @apply bg-slate-100 text-slate-900 antialiased;
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(148 163 184 / 0.5) transparent;
+  }
+}
+
+@layer components {
+  .focus-ring {
+    @apply outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:ring-offset-2;
+  }
+
+  .data-table th {
+    @apply px-4 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wider text-slate-500;
+  }
+
+  .data-table td {
+    @apply px-4 py-3 align-top text-sm text-slate-700;
+  }
+
+  .prose-email {
+    @apply text-sm leading-6 text-slate-800;
+  }
+}
+
+::selection {
+  background: rgb(99 102 241 / 0.2);
+}
