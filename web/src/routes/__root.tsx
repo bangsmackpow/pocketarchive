@@ -9,6 +9,12 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import appCss from '~/styles/app.css?url'
 
 export const Route = createRootRoute({
+  headers: () => ({
+    'Cache-Control': 'private, no-store',
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'no-referrer',
+  }),
   head: () => ({
     meta: [
       { charSet: 'utf-8' },

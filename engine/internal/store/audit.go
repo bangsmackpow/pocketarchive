@@ -56,7 +56,7 @@ func (s *Store) ListAudit(ctx context.Context, tenantID uuid.UUID, f AuditFilter
 			SELECT id, tenant_id, actor_user_id, actor_email, action, target_type, target_id,
 			       ip, user_agent, detail, created_at
 			FROM audit_logs
-			WHERE ($1 = '' OR action = $1)
+			WHERE ($1 = '' OR action ILIKE '%' || $1 || '%')
 			  AND ($2 = '' OR actor_email ILIKE '%' || $2 || '%')
 			  AND ($3::timestamptz IS NULL OR created_at >= $3)
 			  AND ($4::timestamptz IS NULL OR created_at < $4)

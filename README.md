@@ -164,6 +164,8 @@ request to unblock inbound port 25.
 3. Set `SMTP_ALLOWED_DOMAINS=yourcompany.com` (or an IP allowlist / SMTP AUTH).
 4. Mount a publicly trusted certificate for `SMTP_HOSTNAME`:
    `SMTP_TLS_CERT_FILE=/certs/fullchain.pem`, `SMTP_TLS_KEY_FILE=/certs/privkey.pem`.
+   The engine runs as UID 10001, so the mounted key must be readable by that
+   user (for example `chmod 640` plus a matching group, or a Docker secret).
    Without mounted certificates the engine generates a self-signed dev cert.
 5. Send a test message and confirm it appears in **Archive search** with source
    `journal`. Recent journal metrics are shown on **Sources**.
