@@ -175,6 +175,70 @@ then returns `250 OK`. If spooling or enqueueing fails it returns `451` so the
 sender retries. Office 365 journal envelopes are preserved as their own encrypted
 blob while the inner `message/rfc822` original is archived and indexed.
 
+## Troubleshooting
+
+### `password authentication failed for user "archive_app"` (SQLSTATE 28P01)
+
+PostgreSQL runs `/docker-entrypoint-initdb.d` scripts only when its data
+directory is empty. If `postgres_data` already exists from an earlier deploy (or
+was initialized with a different `POSTGRES_PASSWORD`), the `archive_app` role
+keeps its original password. Changing `POSTGRES_PASSWORD` later does not update
+the role automatically.
+
+First confirm the two settings match:
+
+```bash
+docker ps --format '{{.Names}}' | grep -E 'postgres|engine'
+docker inspect <postgres-container> \
+  --format '{{range .Config.Env}}{{println .}}{{end}}' | grep POSTGRES_PASSWORD
+docker inspect <engine-container> \
+  --format '{{range .Config.Env}}{{println .}}{{end}}' | grep DATABASE_URL
+```
+
+**Fix while keeping existing data.** The local Unix socket inside the Postgres
+container uses trust authentication, so no password is needed:
+
+```bash
+docker exec -it <postgres-container> psql -U postgres -d postgres
+```
+
+Then at the `postgres=#` prompt:
+
+```text
+\password archive_app
+```
+
+Enter the exact value of `POSTGRES_PASSWORD` from the stack environment twice,
+then `\q`. Restart/redeploy the engine. Portainer users can do the same from
+*Containers → postgres → Console*.
+
+If the password contains `/`, `@`, `%`, quotes or spaces, regenerate it as hex
+and update the stack environment first, then reset the role to that value:
+
+```bash
+openssl rand -hex 24
+```
+
+Characters like `/` and `%` have special meaning inside `DATABASE_URL`, and
+`@` changes how the URL is parsed.
+
+**Fresh start (destroys the archive database).** Only when there is no data to
+keep:
+
+```bash
+docker compose -f deploy/portainer/docker-compose.yml down
+docker volume ls | grep postgres_data       # confirm the stack's volume name
+docker volume rm <stack-name>_postgres_data
+docker compose -f deploy/portainer/docker-compose.yml up -d
+```
+
+This deletes message metadata, tenant wrapped KEKs and the audit log. Encrypted
+blobs in `archive_blobs` will remain but become unreferenced. Back up first.
+
+To avoid this class of failure: do not reuse a `postgres_data` volume from
+another application, do not change `POSTGRES_PASSWORD` after the first boot, and
+deploy the stack from Git so `deploy/postgres/init-app-role.sh` is mounted.
+
 ### Backups
 
 Back up, ideally to separate storage:

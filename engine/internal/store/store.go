@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/bangsmackpow/pocketarchive/engine/migrations"
@@ -40,6 +41,13 @@ func Open(ctx context.Context, databaseURL string) (*Store, error) {
 	defer cancel()
 	if err := pool.Ping(pingCtx); err != nil {
 		pool.Close()
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "28P01" {
+			return nil, fmt.Errorf(
+				"database authentication failed for archive_app (SQLSTATE 28P01): the password in DATABASE_URL does not match the role stored in the existing PostgreSQL volume; reset the role password or recreate the postgres_data volume (see README Troubleshooting): %w",
+				err,
+			)
+		}
 		return nil, fmt.Errorf("ping database: %w", err)
 	}
 	return s, nil
