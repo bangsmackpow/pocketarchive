@@ -10,12 +10,33 @@ services:
       POSTGRES_DB: postgres
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ../postgres/init-app-role.sh:/docker-entrypoint-initdb.d/00-init-app-role.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d postgres"]
       interval: 10s
       timeout: 5s
       retries: 10
+    networks:
+      - archive
+
+  # One-shot, idempotent database provisioning. It creates/resets the
+  # least-privileged archive_app role and the archive database. The engine never
+  # receives the PostgreSQL superuser password.
+  db-init:
+    image: ${ENGINE_IMAGE:-ghcr.io/bangsmackpow/pocketarchive-engine:latest}
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: postgres
+      PGUSER: postgres
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGSSLMODE: disable
+      ARCHIVE_DB_USER: ${ARCHIVE_DB_USER:-archive_app}
+      ARCHIVE_DB_NAME: ${ARCHIVE_DB_NAME:-archive}
+      ARCHIVE_DB_PASSWORD: ${ARCHIVE_DB_PASSWORD:?set ARCHIVE_DB_PASSWORD in .env}
     networks:
       - archive
 
@@ -51,6 +72,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
       valkey:
         condition: service_healthy
       meilisearch:
@@ -58,7 +81,12 @@ services:
     environment:
       ARCHIVE_ENV: production
       LOG_LEVEL: ${LOG_LEVEL:-info}
-      DATABASE_URL: postgres://archive_app:${POSTGRES_PASSWORD}@postgres:5432/archive?sslmode=disable
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: ${ARCHIVE_DB_NAME:-archive}
+      PGUSER: ${ARCHIVE_DB_USER:-archive_app}
+      PGPASSWORD: ${ARCHIVE_DB_PASSWORD:?set ARCHIVE_DB_PASSWORD in .env}
+      PGSSLMODE: disable
       BLOB_STORAGE_PATH: /data/blobs
       SPOOL_PATH: /data/spool
       ARCHIVE_MASTER_KEK: ${ARCHIVE_MASTER_KEK:?set ARCHIVE_MASTER_KEK in .env}

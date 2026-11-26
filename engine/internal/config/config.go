@@ -24,6 +24,13 @@ type Config struct {
 	BlobPath    string
 	SpoolPath   string
 
+	// AdminDatabaseURL is used only by `engine db-init`. When empty, pgx reads
+	// the standard PG* environment variables (PGHOST, PGPORT, PGUSER, ...).
+	AdminDatabaseURL  string
+	ArchiveDBUser     string
+	ArchiveDBName     string
+	ArchiveDBPassword string
+
 	MasterKEK string
 
 	MeiliURL       string
@@ -74,6 +81,11 @@ func Load() Config {
 		BlobPath:    env("BLOB_STORAGE_PATH", "/data/blobs"),
 		SpoolPath:   env("SPOOL_PATH", "/data/spool"),
 
+		AdminDatabaseURL:  env("ADMIN_DATABASE_URL", ""),
+		ArchiveDBUser:     env("ARCHIVE_DB_USER", "archive_app"),
+		ArchiveDBName:     env("ARCHIVE_DB_NAME", "archive"),
+		ArchiveDBPassword: env("ARCHIVE_DB_PASSWORD", ""),
+
 		MasterKEK: env("ARCHIVE_MASTER_KEK", ""),
 
 		MeiliURL:       env("MEILI_URL", "http://localhost:7700"),
@@ -112,8 +124,8 @@ func Load() Config {
 // ValidateServe checks the settings required to run the engine.
 func (c Config) ValidateServe() error {
 	var missing []string
-	if c.DatabaseURL == "" {
-		missing = append(missing, "DATABASE_URL")
+	if !c.hasDatabaseTarget() {
+		missing = append(missing, "DATABASE_URL or PGHOST+PGDATABASE+PGUSER")
 	}
 	if c.MasterKEK == "" {
 		missing = append(missing, "ARCHIVE_MASTER_KEK")
@@ -134,6 +146,36 @@ func (c Config) ValidateServe() error {
 		return errors.New("DEFAULT_TENANT_SLUG must not be empty")
 	}
 	return nil
+}
+
+// ValidateDatabase checks the connection settings used by migrate, bootstrap
+// and reindex.
+func (c Config) ValidateDatabase() error {
+	if c.hasDatabaseTarget() {
+		return nil
+	}
+	return errors.New("database configuration missing: set DATABASE_URL or PGHOST, PGDATABASE and PGUSER")
+}
+
+// ValidateDBInit checks the settings required by `engine db-init`.
+func (c Config) ValidateDBInit() error {
+	if c.ArchiveDBPassword == "" {
+		return errors.New("ARCHIVE_DB_PASSWORD is required for db-init")
+	}
+	if c.AdminDatabaseURL != "" {
+		return nil
+	}
+	if os.Getenv("PGHOST") == "" || os.Getenv("PGDATABASE") == "" || os.Getenv("PGUSER") == "" {
+		return errors.New("admin database configuration missing: set ADMIN_DATABASE_URL or PGHOST, PGDATABASE and PGUSER")
+	}
+	return nil
+}
+
+func (c Config) hasDatabaseTarget() bool {
+	if c.DatabaseURL != "" {
+		return true
+	}
+	return os.Getenv("PGHOST") != "" && os.Getenv("PGDATABASE") != "" && os.Getenv("PGUSER") != ""
 }
 
 func env(key, fallback string) string {

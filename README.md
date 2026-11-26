@@ -18,18 +18,18 @@ GitHub Actions ──▶ GHCR ──▶ Portainer stack ──▶ Docker / Docke
 pocketarchive/
 ├── web/                       TanStack Start (React + Tailwind) UI and BFF
 ├── engine/                    Go API, SMTP journal receiver, workers
-│   ├── cmd/engine/            serve | migrate | bootstrap | reindex
+│   ├── cmd/engine/            serve | db-init | migrate | bootstrap | reindex
 │   ├── internal/api/          internal REST API
 │   ├── internal/smtp/         STARTTLS journal receiver (go-smtp)
 │   ├── internal/ingest/       journal / mbox / PST parsing
 │   ├── internal/crypto/       envelope encryption (AES-256-GCM)
+│   ├── internal/dbinit/       one-shot PostgreSQL role/database provisioning
 │   ├── internal/store/        PostgreSQL repositories + RLS context
 │   ├── internal/search/       Meilisearch client
 │   ├── internal/worker/       import, journal and index workers
 │   └── migrations/            embedded SQL schema + RLS + triggers
 ├── deploy/portainer/          production Compose stack + .env.example
 ├── deploy/dev/                local Postgres / Meilisearch / Valkey
-├── deploy/postgres/           non-superuser role bootstrap SQL
 └── .github/workflows/ci-cd.yml
 ```
 
@@ -37,6 +37,7 @@ pocketarchive/
 | --- | --- |
 | `web` | Authenticated UI + BFF. Holds the engine JWT in an HttpOnly cookie. |
 | `engine` | REST API, SMTP journal listener, ingestion/index workers, crypto. |
+| `db-init` | One-shot idempotent provisioning of `archive_app` and `archive`. |
 | `postgres` | Immutable metadata, RLS, audit log, job state. |
 | `meilisearch` | Tenant-filtered full-text search. |
 | `valkey` | Login rate limiting (fails open if unavailable). |
@@ -47,7 +48,9 @@ pocketarchive/
   LEVEL SECURITY`, and a policy driven by transaction-local
   `app.current_tenant_id`. The engine connects as `archive_app`, a
   non-superuser role with `NOBYPASSRLS`. Startup refuses to migrate under a
-  superuser/BYPASSRLS role because RLS would be silently bypassed.
+  superuser/BYPASSRLS role because RLS would be silently bypassed. Only the
+  short-lived `db-init` service holds the PostgreSQL superuser password; the
+  engine never receives it.
 - **Envelope encryption** — `ARCHIVE_MASTER_KEK` wraps a random KEK per tenant;
   each blob gets a random 32-byte DEK wrapped with the tenant KEK. Blob and key
   AES-256-GCM AAD is `tenant_id + ":" + sha256`, so ciphertext cannot be moved
@@ -80,6 +83,8 @@ Requirements: Docker, Go 1.26+, Node 22+.
 make dev-up
 
 # 2. Secrets
+export POSTGRES_PASSWORD='devpassword'
+export ARCHIVE_DB_PASSWORD='devpassword'
 export ARCHIVE_MASTER_KEK="$(openssl rand -base64 32)"
 export SESSION_SECRET="$(openssl rand -base64 32)"
 export DATABASE_URL='postgres://archive_app:devpassword@localhost:5432/archive?sslmode=disable'
@@ -93,15 +98,22 @@ export BOOTSTRAP_ADMIN_PASSWORD='ChangeMe-Now-123'
 export SMTP_ALLOWED_DOMAINS='example.com'
 export SESSION_COOKIE_SECURE='false'
 
-# 3. Engine (migrates, seeds the tenant/admin, starts API + SMTP + workers)
+# 3. Provision the local archive_app role and archive database
+make db-init
+
+# 4. Engine (migrates, seeds the tenant/admin, starts API + SMTP + workers)
 cd engine && go run ./cmd/engine serve
 
-# 4. Web (second terminal)
+# 5. Web (second terminal)
 cd web && npm install
 ENGINE_INTERNAL_URL='http://localhost:8080' npm run dev
 ```
 
 Open <http://localhost:3000> and sign in with the bootstrap administrator.
+
+`make dev-down` stops the dependency stack. `make dev-reset` stops it and
+deletes the local development volumes. `make db-init` is idempotent and can be
+re-run to repair the local `archive_app` password.
 
 `make dev-down` stops the dependency stack. Data lives in Docker volumes.
 
@@ -110,6 +122,7 @@ Open <http://localhost:3000> and sign in with the bootstrap administrator.
 ```bash
 engine serve                     # API + SMTP + workers (default)
 engine serve --enable-api=false  # e.g. separate SMTP/worker roles
+engine db-init                   # create/repair archive_app + archive database
 engine migrate
 engine bootstrap --email admin@example.com --password 'long-password'
 engine reindex                   # rebuild the Meilisearch index
@@ -131,7 +144,8 @@ engine version
    openssl rand -base64 32   # ARCHIVE_MASTER_KEK (must decode to exactly 32 bytes)
    openssl rand -base64 32   # SESSION_SECRET (32+ characters)
    openssl rand -base64 32   # MEILI_MASTER_KEY
-   openssl rand -hex 24      # POSTGRES_PASSWORD (hex avoids URL-encoding in DATABASE_URL)
+   openssl rand -hex 24      # POSTGRES_PASSWORD (superuser, used only by db-init)
+   openssl rand -hex 24      # ARCHIVE_DB_PASSWORD (used by the engine)
    ```
 
 4. In Portainer, create a stack **from Git** with:
@@ -140,10 +154,14 @@ engine version
    - Environment: paste the contents of `deploy/portainer/.env.example` with
      real values.
 
-   The stack mounts `deploy/postgres/init-app-role.sh` to create the
-   non-superuser `archive_app` role and `archive` database. Deploying from Git
-   keeps that relative path available. If you paste the Compose file manually,
-   also provide the init script and adjust the volume path.
+   The one-shot `db-init` service waits for PostgreSQL, then idempotently
+   creates or repairs the non-superuser `archive_app` role and `archive`
+   database. The engine starts only after `db-init` exits successfully. No
+   host-path init-script bind mount is used, and the engine never receives the
+   PostgreSQL superuser password.
+
+   Do **not** add a Postfix container for this stack. The Go engine is the SMTP
+   journal listener; Postfix would duplicate TLS, spooling, queuing and policy.
 
 5. Add `PORTAINER_WEBHOOK_URL` as a GitHub Actions secret to redeploy
    automatically after each successful image push.
@@ -179,65 +197,66 @@ blob while the inner `message/rfc822` original is archived and indexed.
 
 ### `password authentication failed for user "archive_app"` (SQLSTATE 28P01)
 
-PostgreSQL runs `/docker-entrypoint-initdb.d` scripts only when its data
-directory is empty. If `postgres_data` already exists from an earlier deploy (or
-was initialized with a different `POSTGRES_PASSWORD`), the `archive_app` role
-keeps its original password. Changing `POSTGRES_PASSWORD` later does not update
-the role automatically.
-
-First confirm the two settings match:
+The production stack now provisions the application role through the one-shot
+`db-init` service. It is idempotent and resets `archive_app` to
+`ARCHIVE_DB_PASSWORD` on every deploy. Start by inspecting the two containers:
 
 ```bash
-docker ps --format '{{.Names}}' | grep -E 'postgres|engine'
-docker inspect <postgres-container> \
-  --format '{{range .Config.Env}}{{println .}}{{end}}' | grep POSTGRES_PASSWORD
-docker inspect <engine-container> \
-  --format '{{range .Config.Env}}{{println .}}{{end}}' | grep DATABASE_URL
+docker ps --format '{{.Names}}' | grep -E 'postgres|db-init|engine'
+docker logs --tail=100 <db-init-container>
+docker logs --tail=100 <engine-container>
 ```
 
-**Fix while keeping existing data.** The local Unix socket inside the Postgres
-container uses trust authentication, so no password is needed:
+Common causes:
+
+- the stack is still running an older engine image without `db-init`
+- `db-init` failed before the engine started
+- the stack was deployed with a missing or changed `ARCHIVE_DB_PASSWORD`
+- the existing `postgres_data` volume was initialized with a different
+  `POSTGRES_PASSWORD`
+
+Redeploy the stack in Portainer so `db-init` runs again. It creates the role
+and database if needed and updates the role password to the current value.
+
+If `db-init` itself cannot authenticate as `postgres`, the existing PostgreSQL
+volume was created with a different superuser password. Reset the superuser
+password through the trusted local socket inside the Postgres container:
 
 ```bash
 docker exec -it <postgres-container> psql -U postgres -d postgres
 ```
 
-Then at the `postgres=#` prompt:
+At the prompt:
 
 ```text
-\password archive_app
+\password postgres
 ```
 
-Enter the exact value of `POSTGRES_PASSWORD` from the stack environment twice,
-then `\q`. Restart/redeploy the engine. Portainer users can do the same from
-*Containers → postgres → Console*.
+Enter the `POSTGRES_PASSWORD` you want to use, then `\q`, and redeploy. This is
+the only remaining case where changing an existing password needs a manual
+step. If there is no data to keep, deleting the `postgres_data` volume is
+simpler.
 
-If the password contains `/`, `@`, `%`, quotes or spaces, regenerate it as hex
-and update the stack environment first, then reset the role to that value:
+The same `\password archive_app` approach remains a manual fallback if you need
+to reset the application role without running `db-init`.
+
+**Fresh start (destroys archive data).**
 
 ```bash
-openssl rand -hex 24
+docker volume ls --format '{{.Name}}' \
+  | grep -E 'postgres_data|meili_data|valkey_data|archive_blobs|archive_spool'
 ```
 
-Characters like `/` and `%` have special meaning inside `DATABASE_URL`, and
-`@` changes how the URL is parsed.
-
-**Fresh start (destroys the archive database).** Only when there is no data to
-keep:
-
-```bash
-docker compose -f deploy/portainer/docker-compose.yml down
-docker volume ls | grep postgres_data       # confirm the stack's volume name
-docker volume rm <stack-name>_postgres_data
-docker compose -f deploy/portainer/docker-compose.yml up -d
-```
-
-This deletes message metadata, tenant wrapped KEKs and the audit log. Encrypted
-blobs in `archive_blobs` will remain but become unreferenced. Back up first.
+Stop/delete the Portainer stack, remove those volumes (and any Postfix volumes
+if an old stack added them), then redeploy. This removes metadata, tenant
+wrapped KEKs and the audit log. Remove `meili_data` as well so stale search
+documents do not survive the reset. Encrypted blobs become unreferenced if you
+keep `archive_blobs` without the database.
 
 To avoid this class of failure: do not reuse a `postgres_data` volume from
-another application, do not change `POSTGRES_PASSWORD` after the first boot, and
-deploy the stack from Git so `deploy/postgres/init-app-role.sh` is mounted.
+another application, and do not change `POSTGRES_PASSWORD` after the first boot.
+`ARCHIVE_DB_PASSWORD` may be rotated by changing it and redeploying, because
+`db-init` re-applies it.
 
 ### Backups
 

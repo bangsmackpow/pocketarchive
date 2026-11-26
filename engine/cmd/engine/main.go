@@ -23,6 +23,7 @@ import (
 	"github.com/bangsmackpow/pocketarchive/engine/internal/bootstrap"
 	"github.com/bangsmackpow/pocketarchive/engine/internal/config"
 	"github.com/bangsmackpow/pocketarchive/engine/internal/crypto"
+	"github.com/bangsmackpow/pocketarchive/engine/internal/dbinit"
 	"github.com/bangsmackpow/pocketarchive/engine/internal/ingest"
 	"github.com/bangsmackpow/pocketarchive/engine/internal/ratelimit"
 	"github.com/bangsmackpow/pocketarchive/engine/internal/search"
@@ -46,6 +47,8 @@ func main() {
 	switch os.Args[1] {
 	case "serve":
 		err = runServe(cfg, log, os.Args[2:])
+	case "db-init":
+		err = runDBInit(cfg, log)
 	case "migrate":
 		err = runMigrate(cfg, log)
 	case "bootstrap":
@@ -72,6 +75,7 @@ func usage() {
 
 Usage:
   engine serve [--enable-api] [--enable-smtp] [--enable-worker]
+  engine db-init
   engine migrate
   engine bootstrap [--email EMAIL] [--password PASSWORD]
   engine reindex
@@ -116,7 +120,7 @@ func runServe(cfg config.Config, log *slog.Logger, args []string) error {
 		log.Warn("initial administrator created; change the bootstrap password after first login", "email", boot.AdminEmail)
 	}
 	if boot.NeedsAdmin {
-		log.Warn("no users exist and BOOTSTRAP_ADMIN_EMAIL/BOOTSTRAP_ADMIN_PASSWORD are not set; run `engine bootstrap --email ... --password ...`")
+		return errors.New("no administrator exists: set BOOTSTRAP_ADMIN_EMAIL and BOOTSTRAP_ADMIN_PASSWORD, or run `engine bootstrap --email ... --password ...`")
 	}
 
 	searchClient := search.NewClient(cfg.MeiliURL, cfg.MeiliMasterKey, cfg.MeiliIndex)
@@ -227,9 +231,28 @@ func runServe(cfg config.Config, log *slog.Logger, args []string) error {
 	return runErr
 }
 
+func runDBInit(cfg config.Config, log *slog.Logger) error {
+	if err := cfg.ValidateDBInit(); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	res, err := dbinit.Ensure(ctx, cfg.AdminDatabaseURL, cfg.ArchiveDBUser, cfg.ArchiveDBName, cfg.ArchiveDBPassword)
+	if err != nil {
+		return err
+	}
+	log.Info("application database initialized",
+		"role", cfg.ArchiveDBUser,
+		"database", cfg.ArchiveDBName,
+		"role_created", res.RoleCreated,
+		"database_created", res.DatabaseCreated,
+	)
+	return nil
+}
+
 func runMigrate(cfg config.Config, log *slog.Logger) error {
-	if cfg.DatabaseURL == "" {
-		return errors.New("DATABASE_URL is required")
+	if err := cfg.ValidateDatabase(); err != nil {
+		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -252,8 +275,8 @@ func runBootstrap(cfg config.Config, log *slog.Logger, args []string) error {
 	slug := fs.String("tenant-slug", cfg.DefaultTenantSlug, "default tenant slug")
 	name := fs.String("tenant-name", cfg.DefaultTenantName, "default tenant name")
 	_ = fs.Parse(args)
-	if cfg.DatabaseURL == "" {
-		return errors.New("DATABASE_URL is required")
+	if err := cfg.ValidateDatabase(); err != nil {
+		return err
 	}
 	master, err := crypto.ParseMasterKey(cfg.MasterKEK)
 	if err != nil {
@@ -290,8 +313,8 @@ func runBootstrap(cfg config.Config, log *slog.Logger, args []string) error {
 }
 
 func runReindex(cfg config.Config, log *slog.Logger) error {
-	if cfg.DatabaseURL == "" {
-		return errors.New("DATABASE_URL is required")
+	if err := cfg.ValidateDatabase(); err != nil {
+		return err
 	}
 	if cfg.MeiliURL == "" {
 		return errors.New("MEILI_URL is required")

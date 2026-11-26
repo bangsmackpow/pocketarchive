@@ -44,7 +44,7 @@ func Open(ctx context.Context, databaseURL string) (*Store, error) {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "28P01" {
 			return nil, fmt.Errorf(
-				"database authentication failed for archive_app (SQLSTATE 28P01): the password in DATABASE_URL does not match the role stored in the existing PostgreSQL volume; reset the role password or recreate the postgres_data volume (see README Troubleshooting): %w",
+				"database authentication failed for archive_app (SQLSTATE 28P01): PGPASSWORD/DATABASE_URL does not match the role stored in PostgreSQL; run `engine db-init` or reset the role password (see README Troubleshooting): %w",
 				err,
 			)
 		}
