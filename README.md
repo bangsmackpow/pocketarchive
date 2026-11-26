@@ -2,87 +2,103 @@
 
 Self-hosted, multi-tenant-ready email archiving and compliance platform for
 Microsoft 365. PocketArchive receives Exchange Online journal reports (or PST /
-mbox imports), encrypts every raw message and attachment, indexes searchable
-metadata, and enforces legal hold and retention at both the API and PostgreSQL
+mbox imports), encrypts raw messages and attachments, indexes searchable
+metadata, and enforces retention and legal hold at both the API and PostgreSQL
 layers.
 
-Built to deploy as a single Docker stack on a Linux VM:
+The project is an MVP intended to run as a single Docker stack on a Linux VM:
 
-```
+```text
 GitHub Actions ──▶ GHCR ──▶ Portainer stack ──▶ Docker / Docker Compose
 ```
 
-## Components
+## Architecture at a glance
 
-```
-pocketarchive/
-├── web/                       TanStack Start (React + Tailwind) UI and BFF
-├── engine/                    Go API, SMTP journal receiver, workers
-│   ├── cmd/engine/            serve | db-init | migrate | bootstrap | reindex
-│   ├── internal/api/          internal REST API
-│   ├── internal/smtp/         STARTTLS journal receiver (go-smtp)
-│   ├── internal/ingest/       journal / mbox / PST parsing
-│   ├── internal/crypto/       envelope encryption (AES-256-GCM)
-│   ├── internal/dbinit/       one-shot PostgreSQL role/database provisioning
-│   ├── internal/store/        PostgreSQL repositories + RLS context
-│   ├── internal/search/       Meilisearch client
-│   ├── internal/worker/       import, journal and index workers
-│   └── migrations/            embedded SQL schema + RLS + triggers
-├── deploy/portainer/          production Compose stack + .env.example
-├── deploy/dev/                local Postgres / Meilisearch / Valkey
-└── .github/workflows/ci-cd.yml
+```text
+Microsoft 365 journaling
+        │ SMTP + STARTTLS
+        ▼
+┌──────────────────────────── pocketarchive-engine ────────────────────────────┐
+│ Go SMTP receiver ──▶ spool ──▶ journal queue                                 │
+│                                                                             │
+│ Import uploads ──▶ chunked spool ──▶ import jobs                            │
+│                                                                             │
+│ Workers ──▶ journal/mbox/PST parser ──▶ envelope encryption ──▶ PostgreSQL   │
+│                                      └──▶ SHA-256 blob deduplication         │
+│                                      └──▶ Meilisearch indexing              │
+│                                                                             │
+│ HTTP API ◀── TanStack Start BFF ◀── browser session cookie                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+        │                    │                         │
+        ▼                    ▼                         ▼
+   PostgreSQL 16       Meilisearch               Valkey 8
+   metadata, RLS,      tenant-filtered           login rate
+   audit, retention    full-text search          limiting
 ```
 
 | Service | Purpose |
 | --- | --- |
-| `web` | Authenticated UI + BFF. Holds the engine JWT in an HttpOnly cookie. |
-| `engine` | REST API, SMTP journal listener, ingestion/index workers, crypto. |
+| `web` | TanStack Start UI + BFF. Stores the engine JWT in an HttpOnly cookie. |
+| `engine` | REST API, Go SMTP journal receiver, ingestion/index workers, crypto. |
 | `db-init` | One-shot idempotent provisioning of `archive_app` and `archive`. |
-| `postgres` | Immutable metadata, RLS, audit log, job state. |
+| `postgres` | Metadata, row-level security, audit log, retention, job state. |
 | `meilisearch` | Tenant-filtered full-text search. |
-| `valkey` | Login rate limiting (fails open if unavailable). |
+| `valkey` | Login rate limiting; failures fail open. |
 
-## Security model
+**No Postfix is used.** The Go engine is the SMTP journal listener. Adding
+Postfix would duplicate TLS, spooling, queueing and sender policy.
 
-- **Tenant isolation** — every tenant-scoped table has `tenant_id`, `FORCE ROW
-  LEVEL SECURITY`, and a policy driven by transaction-local
-  `app.current_tenant_id`. The engine connects as `archive_app`, a
-  non-superuser role with `NOBYPASSRLS`. Startup refuses to migrate under a
-  superuser/BYPASSRLS role because RLS would be silently bypassed. Only the
-  short-lived `db-init` service holds the PostgreSQL superuser password; the
-  engine never receives it.
-- **Envelope encryption** — `ARCHIVE_MASTER_KEK` wraps a random KEK per tenant;
-  each blob gets a random 32-byte DEK wrapped with the tenant KEK. Blob and key
-  AES-256-GCM AAD is `tenant_id + ":" + sha256`, so ciphertext cannot be moved
-  between tenants or renamed.
-- **Deduplication** — SHA-256 is calculated on raw `.eml` bytes and each
-  attachment before encryption. Blobs are stored once per tenant at
-  `tenants/{tenant_id}/blobs/{sha256[:2]}/{sha256}`.
-- **Integrity** — messages carry `raw_sha256`, immutable `retain_until` and
-  `legal_hold`. PostgreSQL triggers reject deletion while held or retained, block
-  metadata mutation, and prevent shortening retention. The API applies the same
-  checks before attempting a delete.
-- **Audit** — `audit_logs` is append-only (a trigger rejects UPDATE/DELETE) and
-  records logins, ingestion, search queries, message views, attachment
-  downloads, exports, legal-hold changes, imports, sources and retention changes.
-- **Browser auth** — the engine issues an HS256 JWT plus revocable session row.
-  The web BFF stores the JWT in a `HttpOnly`, `SameSite=Lax` cookie; the token is
-  never exposed to browser JavaScript. The BFF proxy strips cookies and adds
-  `Authorization: Bearer`.
+## Repository layout
 
-> The raw message body is stored in PostgreSQL for preview and search. Database
-> and volume encryption remain an infrastructure responsibility. Blob objects
-> (raw `.eml`, journal envelopes, attachments) are always encrypted.
+```text
+pocketarchive/
+├── web/                       TanStack Start (React + Tailwind) frontend + BFF
+├── engine/                    Go backend and workers
+│   ├── cmd/engine/            serve | db-init | migrate | bootstrap | reindex
+│   ├── internal/api/          internal REST API
+│   ├── internal/smtp/         STARTTLS journal receiver (go-smtp)
+│   ├── internal/ingest/       journal / mbox / PST parsing and HTML sanitization
+│   ├── internal/crypto/       envelope encryption (AES-256-GCM)
+│   ├── internal/dbinit/       idempotent PostgreSQL provisioning
+│   ├── internal/store/        PostgreSQL repositories and tenant context
+│   ├── internal/search/       Meilisearch client
+│   ├── internal/worker/       journal, import and search-index workers
+│   └── migrations/            embedded SQL schema, RLS and triggers
+├── deploy/portainer/          production Compose stack + .env.example
+├── deploy/dev/                local PostgreSQL / Meilisearch / Valkey
+├── docs/                      architecture, deployment, operations, API and security
+├── .github/workflows/ci-cd.yml
+├── Makefile
+└── README.md
+```
+
+## Security highlights
+
+- Tenant-scoped tables have `tenant_id`, `FORCE ROW LEVEL SECURITY` and policies
+  driven by transaction-local `app.current_tenant_id`.
+- The engine connects as `archive_app` (`NOSUPERUSER NOBYPASSRLS`). Only the
+  short-lived `db-init` container receives the PostgreSQL superuser password.
+- Blobs use envelope encryption: a master KEK wraps per-tenant KEKs, which wrap
+  per-blob DEKs. AES-256-GCM AAD binds ciphertext to tenant and SHA-256.
+- Identical raw messages and attachments are deduplicated per tenant.
+- Message metadata is immutable. PostgreSQL triggers reject deletion during
+  legal hold or retention, and prevent retention from being shortened.
+- `audit_logs` is append-only. Logins, ingestion, searches, views, downloads,
+  exports, legal-hold changes and configuration changes are recorded.
+- The browser only sees an HttpOnly, SameSite cookie; the engine JWT is never
+  exposed to JavaScript.
+
+See [docs/security.md](docs/security.md) for the threat model and limitations.
 
 ## Quick start (development)
 
 Requirements: Docker, Go 1.26+, Node 22+.
 
 ```bash
-# 1. Local dependencies
+# 1. Local PostgreSQL, Meilisearch and Valkey
 make dev-up
 
-# 2. Secrets
+# 2. Development configuration
 export POSTGRES_PASSWORD='devpassword'
 export ARCHIVE_DB_PASSWORD='devpassword'
 export ARCHIVE_MASTER_KEK="$(openssl rand -base64 32)"
@@ -98,218 +114,100 @@ export BOOTSTRAP_ADMIN_PASSWORD='ChangeMe-Now-123'
 export SMTP_ALLOWED_DOMAINS='example.com'
 export SESSION_COOKIE_SECURE='false'
 
-# 3. Provision the local archive_app role and archive database
+# 3. Create the local archive_app role and archive database (idempotent)
 make db-init
 
-# 4. Engine (migrates, seeds the tenant/admin, starts API + SMTP + workers)
+# 4. Run the engine: migrations, tenant/admin seed, API + SMTP + workers
 cd engine && go run ./cmd/engine serve
 
-# 5. Web (second terminal)
+# 5. Run the web app in a second terminal
 cd web && npm install
 ENGINE_INTERNAL_URL='http://localhost:8080' npm run dev
 ```
 
 Open <http://localhost:3000> and sign in with the bootstrap administrator.
 
-`make dev-down` stops the dependency stack. `make dev-reset` stops it and
-deletes the local development volumes. `make db-init` is idempotent and can be
-re-run to repair the local `archive_app` password.
-
-`make dev-down` stops the dependency stack. Data lives in Docker volumes.
-
-### Engine commands
+Useful commands:
 
 ```bash
-engine serve                     # API + SMTP + workers (default)
-engine serve --enable-api=false  # e.g. separate SMTP/worker roles
-engine db-init                   # create/repair archive_app + archive database
-engine migrate
-engine bootstrap --email admin@example.com --password 'long-password'
-engine reindex                   # rebuild the Meilisearch index
-engine version
+make dev-down       # stop local dependencies
+make dev-reset      # stop and delete local development volumes
+make db-init        # repair/reapply the local archive_app password
+make test           # Go tests + web production build
 ```
 
-## Production deployment (Portainer + GHCR)
+Full instructions: [docs/development.md](docs/development.md).
 
-1. Push this repository to `main`. GitHub Actions builds and pushes:
-   - `ghcr.io/<owner>/pocketarchive-engine:latest`
-   - `ghcr.io/<owner>/pocketarchive-engine:<sha>`
-   - `ghcr.io/<owner>/pocketarchive-web:latest`
-   - `ghcr.io/<owner>/pocketarchive-web:<sha>`
-2. Make both GHCR packages **public** (or add a registry credential to
-   Portainer) under *Package settings → Change visibility*.
-3. Generate secrets:
+## Production deployment
 
+1. Push to `main`; CI builds and publishes:
+   - `ghcr.io/<owner>/pocketarchive-engine:latest` and `:<sha>`
+   - `ghcr.io/<owner>/pocketarchive-web:latest` and `:<sha>`
+2. In Portainer, create a **Git-based stack** using
+   `deploy/portainer/docker-compose.yml`.
+3. Set the environment from `deploy/portainer/.env.example`:
    ```bash
-   openssl rand -base64 32   # ARCHIVE_MASTER_KEK (must decode to exactly 32 bytes)
-   openssl rand -base64 32   # SESSION_SECRET (32+ characters)
+   openssl rand -base64 32   # ARCHIVE_MASTER_KEK
+   openssl rand -base64 32   # SESSION_SECRET
    openssl rand -base64 32   # MEILI_MASTER_KEY
-   openssl rand -hex 24      # POSTGRES_PASSWORD (superuser, used only by db-init)
-   openssl rand -hex 24      # ARCHIVE_DB_PASSWORD (used by the engine)
+   openssl rand -hex 24      # POSTGRES_PASSWORD (superuser; postgres + db-init only)
+   openssl rand -hex 24      # ARCHIVE_DB_PASSWORD (engine)
    ```
+4. Terminate TLS in front of port `3000`. Production cookies are `Secure`.
+5. Point Office 365 journaling at the engine on port `2525` (or add port 25),
+   with a trusted SMTP certificate and `SMTP_ALLOWED_DOMAINS` set.
 
-4. In Portainer, create a stack **from Git** with:
-   - Repository: your PocketArchive repo
-   - Compose path: `deploy/portainer/docker-compose.yml`
-   - Environment: paste the contents of `deploy/portainer/.env.example` with
-     real values.
-
-   The one-shot `db-init` service waits for PostgreSQL, then idempotently
-   creates or repairs the non-superuser `archive_app` role and `archive`
-   database. The engine starts only after `db-init` exits successfully. No
-   host-path init-script bind mount is used, and the engine never receives the
-   PostgreSQL superuser password.
-
-   Do **not** add a Postfix container for this stack. The Go engine is the SMTP
-   journal listener; Postfix would duplicate TLS, spooling, queuing and policy.
-
-5. Add `PORTAINER_WEBHOOK_URL` as a GitHub Actions secret to redeploy
-   automatically after each successful image push.
-
-Only port `3000` (web) and `2525` (SMTP journal) are published. The engine API
-stays on the internal Docker network. Terminate TLS in front of port 3000
-(Caddy, Traefik, nginx, or a cloud load balancer): production cookies are marked
-`Secure`, so the UI must be served over HTTPS. To accept journal mail on port
-25, add `"25:2525"` to the engine ports; most cloud providers require a support
-request to unblock inbound port 25.
-
-### Office 365 journaling
-
-1. Create a shared mailbox or mail contact for the journal target
-   (`journal@mail.yourcompany.com` by default).
-2. In Microsoft Purview / Exchange admin center, create a journal rule that
-   sends all internal and external messages to that address.
-3. Set `SMTP_ALLOWED_DOMAINS=yourcompany.com` (or an IP allowlist / SMTP AUTH).
-4. Mount a publicly trusted certificate for `SMTP_HOSTNAME`:
-   `SMTP_TLS_CERT_FILE=/certs/fullchain.pem`, `SMTP_TLS_KEY_FILE=/certs/privkey.pem`.
-   The engine runs as UID 10001, so the mounted key must be readable by that
-   user (for example `chmod 640` plus a matching group, or a Docker secret).
-   Without mounted certificates the engine generates a self-signed dev cert.
-5. Send a test message and confirm it appears in **Archive search** with source
-   `journal`. Recent journal metrics are shown on **Sources**.
-
-The receiver writes the MIME payload to the spool, inserts a queue row, and only
-then returns `250 OK`. If spooling or enqueueing fails it returns `451` so the
-sender retries. Office 365 journal envelopes are preserved as their own encrypted
-blob while the inner `message/rfc822` original is archived and indexed.
-
-## Troubleshooting
-
-### `password authentication failed for user "archive_app"` (SQLSTATE 28P01)
-
-The production stack now provisions the application role through the one-shot
-`db-init` service. It is idempotent and resets `archive_app` to
-`ARCHIVE_DB_PASSWORD` on every deploy. Start by inspecting the two containers:
-
-```bash
-docker ps --format '{{.Names}}' | grep -E 'postgres|db-init|engine'
-docker logs --tail=100 <db-init-container>
-docker logs --tail=100 <engine-container>
-```
-
-Common causes:
-
-- the stack is still running an older engine image without `db-init`
-- `db-init` failed before the engine started
-- the stack was deployed with a missing or changed `ARCHIVE_DB_PASSWORD`
-- the existing `postgres_data` volume was initialized with a different
-  `POSTGRES_PASSWORD`
-
-Redeploy the stack in Portainer so `db-init` runs again. It creates the role
-and database if needed and updates the role password to the current value.
-
-If `db-init` itself cannot authenticate as `postgres`, the existing PostgreSQL
-volume was created with a different superuser password. Reset the superuser
-password through the trusted local socket inside the Postgres container:
-
-```bash
-docker exec -it <postgres-container> psql -U postgres -d postgres
-```
-
-At the prompt:
+Startup order is deterministic:
 
 ```text
-\password postgres
+postgres (TCP healthy) → db-init (exit 0) → engine migrations/bootstrap → web
 ```
 
-Enter the `POSTGRES_PASSWORD` you want to use, then `\q`, and redeploy. This is
-the only remaining case where changing an existing password needs a manual
-step. If there is no data to keep, deleting the `postgres_data` volume is
-simpler.
+The complete deployment guide is [docs/deployment.md](docs/deployment.md).
+Office 365 journaling is covered in
+[docs/smtp-journaling.md](docs/smtp-journaling.md).
 
-The same `\password archive_app` approach remains a manual fallback if you need
-to reset the application role without running `db-init`.
+## Documentation
 
-**Fresh start (destroys archive data).**
-
-```bash
-docker volume ls --format '{{.Name}}' \
-  | grep -E 'postgres_data|meili_data|valkey_data|archive_blobs|archive_spool'
-```
-
-Stop/delete the Portainer stack, remove those volumes (and any Postfix volumes
-if an old stack added them), then redeploy. This removes metadata, tenant
-wrapped KEKs and the audit log. Remove `meili_data` as well so stale search
-documents do not survive the reset. Encrypted blobs become unreferenced if you
-keep `archive_blobs` without the database.
-
-To avoid this class of failure: do not reuse a `postgres_data` volume from
-another application, and do not change `POSTGRES_PASSWORD` after the first boot.
-`ARCHIVE_DB_PASSWORD` may be rotated by changing it and redeploying, because
-`db-init` re-applies it.
-
-### Backups
-
-Back up, ideally to separate storage:
-
-- PostgreSQL (metadata, tenant wrapped KEKs, audit log, job state)
-- the `archive_blobs` volume (encrypted blobs)
-- `ARCHIVE_MASTER_KEK` in a secrets manager / offline vault
-
-Restoring blobs without the master KEK is impossible by design. The spool and
-Meilisearch index are disposable; search can be rebuilt with `engine reindex`.
-
-## Authentication API
-
-The engine exposes `/api/v1` to the web BFF:
-
-- `POST /auth/login`, `GET /auth/me`, `POST /auth/logout`
-- `GET /tenant`, `PUT /tenant/settings`
-- `GET /setup`, `GET /stats`, `GET|POST|PATCH|DELETE /sources`
-- `POST /imports`, `PUT /imports/{id}/chunks/{n}`, `POST /imports/{id}/complete`
-- `GET /imports`, `GET /imports/{id}`, `GET /imports/{id}/errors`
-- `GET /search` (query, sender, recipient, dates, attachment flag, source, legal hold)
-- `GET /messages/{id}`, `DELETE /messages/{id}`
-- `GET /messages/{id}/export`, `GET /messages/{id}/attachments/{attachmentId}`
-- `POST /messages/{id}/legal-hold`
-- `GET /audit-logs`
-- `GET /healthz`, `GET /readyz`
-
-All protected endpoints require `Authorization: Bearer <JWT>` and resolve the
-tenant from the token; tenant IDs are never accepted from clients.
+| Document | Contents |
+| --- | --- |
+| [docs/architecture.md](docs/architecture.md) | Components, data flows, schema, startup lifecycle, scaling, failure behavior |
+| [docs/deployment.md](docs/deployment.md) | VM prerequisites, Portainer/Git stack, environment reference, first boot, TLS, upgrades |
+| [docs/operations.md](docs/operations.md) | Health checks, logs, backups/restore, key and password rotation, reindex, reset, disaster recovery |
+| [docs/security.md](docs/security.md) | Trust boundaries, RLS, encryption, secrets, auth, audit, hardening, known gaps |
+| [docs/api.md](docs/api.md) | Internal REST API, auth, endpoint reference, upload/search/legal-hold examples |
+| [docs/smtp-journaling.md](docs/smtp-journaling.md) | Go SMTP receiver behavior, Office 365 setup, TLS, allowlists, testing, quarantine |
+| [docs/troubleshooting.md](docs/troubleshooting.md) | Startup, database, image, SMTP, search, import and UI issues |
+| [docs/development.md](docs/development.md) | Local workflow, tests, migrations, adding API/UI features |
+| [docs/adr/0001-database-provisioning.md](docs/adr/0001-database-provisioning.md) | Why database provisioning is a `db-init` job, not a Postgres init script |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution workflow and repository conventions |
+| [SECURITY.md](SECURITY.md) | Vulnerability reporting and deployment security checklist |
 
 ## Verification
 
 ```bash
 cd engine && go build ./... && go vet ./... && go test ./...
 cd web && npm ci && npm run typecheck && npm run build
-docker compose -f deploy/portainer/docker-compose.yml --env-file deploy/portainer/.env.example config
+docker compose -f deploy/portainer/docker-compose.yml \
+  --env-file deploy/portainer/.env.example config
 docker compose -f deploy/dev/docker-compose.dev.yml config
 ```
 
-CI runs the Go and web checks on every PR and publishes multi-stage images only
-from `main`. The engine image compiles `readpst` from pinned libpst 0.6.76
-(because Alpine has no libpst package) and runs as UID 10001.
+CI runs the Go and web checks on every PR. On `main` it builds and pushes the
+images, then optionally triggers a Portainer webhook. Published images are
+currently `linux/amd64`; the engine image compiles `readpst` from pinned libpst
+0.6.76 and runs as UID 10001.
 
-## Current limitations / roadmap
+## Current limitations
 
-- Single visible tenant in the UI; tenant IDs, RLS, KEKs and search filters are
-  already multi-tenant throughout.
+- Single-tenant UI. Tenant IDs, RLS, KEKs, storage paths and search filters are
+  multi-tenant throughout, but there is no tenant switcher or tenant-admin API.
 - No Microsoft Graph mailbox sync, MFA/SSO, S3 blob backend, antivirus scanning,
   automated backup scheduler, or blob garbage collection.
-- Retention applies to newly ingested messages; existing `retain_until` values
+- Message bodies are stored in PostgreSQL for preview and search. Database and
+  volume encryption remain infrastructure responsibilities.
+- Retention applies to newly ingested messages. Existing `retain_until` values
   are immutable and can only be extended.
-- Legal holds and retention are enforced, but a full records-management policy
-  engine (labels, disposition review) is future work.
-- Only `linux/amd64` images are published today; the Go binary is portable, but
-  the libpst build would need an arm64 build stage for arm64 images.
+- The deployment is designed for a single engine instance sharing the blob and
+  spool volumes; horizontal scaling and HA are not yet supported.
+- Only `linux/amd64` images are published.
